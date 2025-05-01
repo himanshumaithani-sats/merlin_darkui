@@ -172,6 +172,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
           break;
         case "cancel":
           newStatus = "cancelled";
+          // Mark job as cancelled in tracking system
+          cancelTrackingJob(jobId);
           break;
       }
       

@@ -3,10 +3,33 @@ import fetch from 'node-fetch';
 import { parse } from 'csv-parse/sync';
 import * as XLSX from 'xlsx';
 import { Readable } from 'stream';
-import { InsertTrackResult, TrackResult } from '@shared/schema';
+import { InsertTrackResult, TrackResult, TrackJobStatus } from '@shared/schema';
 import { storage } from './storage';
 import { google } from 'googleapis';
 import { WebSocketServer } from 'ws';
+
+// Map of active tracking jobs and their cancellation status
+const activeJobs = new Map<number, boolean>();
+
+// Add a job to the active jobs map
+export function startTrackingJob(jobId: number): void {
+  activeJobs.set(jobId, false);
+}
+
+// Mark a job as cancelled
+export function cancelTrackingJob(jobId: number): void {
+  activeJobs.set(jobId, true);
+}
+
+// Check if a job should be cancelled
+export function shouldCancelJob(jobId: number): boolean {
+  return activeJobs.get(jobId) === true;
+}
+
+// Remove a job from the active jobs map
+export function finishTrackingJob(jobId: number): void {
+  activeJobs.delete(jobId);
+}
 
 // Parse MAWB - splitting prefix and awbno
 export function splitMAWB(mawb: string): { prefix: string, awbNo: string } {
@@ -116,6 +139,9 @@ function parseTrackingHTML(html: string): Partial<TrackResult> {
 // Process CSV file
 export async function processCSVFile(fileBuffer: Buffer, jobId: number, delay: number = 100, wss?: WebSocketServer): Promise<number> {
   try {
+    // Register job in the active jobs tracking
+    startTrackingJob(jobId);
+    
     // Parse CSV
     const csvText = fileBuffer.toString('utf-8');
     const records = parse(csvText, { 
@@ -146,6 +172,36 @@ export async function processCSVFile(fileBuffer: Buffer, jobId: number, delay: n
     // Process each record
     let processedCount = 0;
     for (const record of records) {
+      // Check if the job has been cancelled
+      if (shouldCancelJob(jobId)) {
+        broadcastMessage(wss, jobId, {
+          type: 'log',
+          message: 'Job has been cancelled.',
+          level: 'info'
+        });
+        
+        finishTrackingJob(jobId);
+        return processedCount;
+      }
+      
+      // Get current job status from database
+      const job = await storage.getTrackJob(jobId);
+      if (!job) {
+        throw new Error('Job not found');
+      }
+      
+      // If job was externally cancelled or paused, stop processing
+      if (job.status === 'cancelled') {
+        broadcastMessage(wss, jobId, {
+          type: 'log',
+          message: 'Job has been cancelled.',
+          level: 'info'
+        });
+        
+        finishTrackingJob(jobId);
+        return processedCount;
+      }
+      
       // Get current row number
       processedCount++;
       
@@ -229,17 +285,21 @@ export async function processCSVFile(fileBuffer: Buffer, jobId: number, delay: n
       await new Promise(resolve => setTimeout(resolve, delay));
     }
     
-    // Mark job as completed
-    await storage.updateTrackJobStatus(jobId, 'completed');
-    broadcastMessage(wss, jobId, {
-      type: 'complete',
-      message: `Tracking completed. Processed ${processedCount} records.`
-    });
+    // Mark job as completed if not cancelled
+    if (!shouldCancelJob(jobId)) {
+      await storage.updateTrackJobStatus(jobId, 'completed');
+      broadcastMessage(wss, jobId, {
+        type: 'complete',
+        message: `Tracking completed. Processed ${processedCount} records.`
+      });
+    }
     
+    finishTrackingJob(jobId);
     return processedCount;
   } catch (error) {
     console.error('Error processing CSV:', error);
     await storage.updateTrackJobStatus(jobId, 'failed');
+    finishTrackingJob(jobId);
     throw error;
   }
 }
@@ -247,6 +307,9 @@ export async function processCSVFile(fileBuffer: Buffer, jobId: number, delay: n
 // Process Excel file
 export async function processExcelFile(fileBuffer: Buffer, jobId: number, delay: number = 100, wss?: WebSocketServer): Promise<number> {
   try {
+    // Register job in the active jobs tracking
+    startTrackingJob(jobId);
+    
     // Parse Excel
     const workbook = XLSX.read(fileBuffer);
     const firstSheetName = workbook.SheetNames[0];
@@ -276,6 +339,36 @@ export async function processExcelFile(fileBuffer: Buffer, jobId: number, delay:
     // Process each record
     let processedCount = 0;
     for (const record of records) {
+      // Check if the job has been cancelled
+      if (shouldCancelJob(jobId)) {
+        broadcastMessage(wss, jobId, {
+          type: 'log',
+          message: 'Job has been cancelled.',
+          level: 'info'
+        });
+        
+        finishTrackingJob(jobId);
+        return processedCount;
+      }
+      
+      // Get current job status from database
+      const job = await storage.getTrackJob(jobId);
+      if (!job) {
+        throw new Error('Job not found');
+      }
+      
+      // If job was externally cancelled or paused, stop processing
+      if (job.status === 'cancelled') {
+        broadcastMessage(wss, jobId, {
+          type: 'log',
+          message: 'Job has been cancelled.',
+          level: 'info'
+        });
+        
+        finishTrackingJob(jobId);
+        return processedCount;
+      }
+      
       // Get current row number
       processedCount++;
       
@@ -359,17 +452,21 @@ export async function processExcelFile(fileBuffer: Buffer, jobId: number, delay:
       await new Promise(resolve => setTimeout(resolve, delay));
     }
     
-    // Mark job as completed
-    await storage.updateTrackJobStatus(jobId, 'completed');
-    broadcastMessage(wss, jobId, {
-      type: 'complete',
-      message: `Tracking completed. Processed ${processedCount} records.`
-    });
+    // Mark job as completed if not cancelled
+    if (!shouldCancelJob(jobId)) {
+      await storage.updateTrackJobStatus(jobId, 'completed');
+      broadcastMessage(wss, jobId, {
+        type: 'complete',
+        message: `Tracking completed. Processed ${processedCount} records.`
+      });
+    }
     
+    finishTrackingJob(jobId);
     return processedCount;
   } catch (error) {
     console.error('Error processing Excel:', error);
     await storage.updateTrackJobStatus(jobId, 'failed');
+    finishTrackingJob(jobId);
     throw error;
   }
 }
