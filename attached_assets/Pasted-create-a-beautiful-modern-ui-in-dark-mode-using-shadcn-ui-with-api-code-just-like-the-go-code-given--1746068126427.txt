@@ -1,0 +1,231 @@
+create a beautiful modern ui in dark mode using shadcn ui with api code just like the go code given here such that we will upload a csv/excel file to the ui it will have a streaming ui modern and it will do the processing just as the go code does do not wait to make calls while scraping you can take like 50 or 100 ms seconds wait max that's it and then either produce an output as an excel sheet or live populate the google sheets
+package main
+
+import (
+"encoding/csv"
+"fmt"
+"io"
+"log"
+"net/http"
+"net/http/cookiejar"
+"net/url"
+"os"
+"regexp"
+"strings"
+"time"
+
+
+"github.com/PuerkitoBio/goquery"
+"github.com/xuri/excelize/v2"
+)
+
+type TrackResult struct {
+MAWB      string
+Prefix    string
+AWBNo     string
+Status    string
+Origin    string
+Dest      string
+Pcs       string
+GrossWt   string
+LastAct   string
+LastActDt string
+DOUrl     string
+}
+
+func main() {
+http.HandleFunc("/track", trackHandler)
+fmt.Println("Server started at :8080. Hit /track to start tracking.")
+log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func trackHandler(w http.ResponseWriter, r *http.Request) {
+log.Println("/track endpoint hit. Starting CSV processing...")
+output := "output_tracking.xlsx"
+count, err := processCSVRealtime("csvs/ALL INBOUND (JAN)-Table 1.csv", output)
+if err != nil {
+log.Printf("Error in processCSVRealtime: %v", err)
+w.WriteHeader(http.StatusInternalServerError)
+fmt.Fprintf(w, "Error: %v", err)
+return
+}
+log.Printf("Tracking complete! %d records written to %s", count, output)
+fmt.Fprintf(w, "Tracking complete! %d records written to %s", count, output)
+}
+
+func processCSVRealtime(path string, excelPath string) (int, error) {
+f, err := os.Open(path)
+if err != nil {
+return 0, err
+}
+defer f.Close()
+reader := csv.NewReader(f)
+reader.FieldsPerRecord = -1
+headers, err := reader.Read()
+if err != nil {
+return 0, err
+}
+mawbIdx := -1
+for i, h := range headers {
+if strings.Contains(strings.ToUpper(h), "MAWB") {
+mawbIdx = i
+break
+}
+}
+if mawbIdx == -1 {
+return 0, fmt.Errorf("MAWB column not found")
+}
+xl := excelize.NewFile()
+sheet := "Sheet1"
+headersExcel := []string{"MAWB", "Prefix", "AWBNo", "Status", "Origin", "Dest", "Pcs", "GrossWt", "LastAct", "DOUrl"}
+for i, h := range headersExcel {
+cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+xl.SetCellValue(sheet, cell, h)
+}
+rowNum := 1
+savedRows := 0
+for {
+rec, err := reader.Read()
+if err == io.EOF {
+break
+}
+if err != nil {
+log.Printf("[Row %d] Error reading CSV: %v", rowNum, err)
+continue
+}
+rowNum++
+mawb := rec[mawbIdx]
+prefix, awbno := splitMAWB(mawb)
+if prefix == "" || awbno == "" {
+log.Printf("[Row %d] Skipping invalid MAWB: %s", rowNum, mawb)
+continue
+}
+log.Printf("[Row %d] Tracking MAWB: %s (prefix: %s, awbno: %s)", rowNum, mawb, prefix, awbno)
+res, err := trackAWB(prefix, awbno)
+if err != nil {
+log.Printf("[Row %d] Error tracking %s: %v", rowNum, mawb, err)
+continue
+}
+log.Printf("[Row %d] Success: %s", rowNum, mawb)
+res.MAWB = mawb
+res.Prefix = prefix
+res.AWBNo = awbno
+vals := []string{res.MAWB, res.Prefix, res.AWBNo, res.Status, res.Origin, res.Dest, res.Pcs, res.GrossWt, res.LastAct, res.DOUrl}
+for col, v := range vals {
+cell, _ := excelize.CoordinatesToCellName(col+1, savedRows+2)
+xl.SetCellValue(sheet, cell, v)
+}
+savedRows++
+// Save after each row
+err = xl.SaveAs(excelPath)
+if err != nil {
+log.Printf("[Row %d] Error saving Excel: %v", rowNum, err)
+}
+// Be polite to server
+time.Sleep(2 * time.Second)
+}
+return savedRows, nil
+}
+
+func splitMAWB(mawb string) (string, string) {
+mawb = strings.TrimSpace(mawb)
+mawb = strings.ReplaceAll(mawb, " ", "")
+parts := strings.Split(mawb, "-")
+if len(parts) == 2 {
+return parts[0], parts[1]
+}
+re := regexp.MustCompile((\d{3})[- ]?(\d{8}))
+m := re.FindStringSubmatch(mawb)
+if len(m) == 3 {
+return m[1], m[2]
+}
+return "", ""
+}
+
+func trackAWB(prefix, awbno string) (TrackResult, error) {
+client, _ := cookiejar.New(nil)
+cl := &http.Client{Jar: client, Timeout: 30 * time.Second}
+// 1. GET to fetch VIEWSTATE
+resp, err := cl.Get("https://airasia.smartkargo.com/FrmAWBTracking.aspx")
+if err != nil {
+return TrackResult{}, err
+}
+doc, err := goquery.NewDocumentFromReader(resp.Body)
+resp.Body.Close()
+if err != nil {
+return TrackResult{}, err
+}
+viewState, _ := doc.Find("#__VIEWSTATE").Attr("value")
+viewGen, _ := doc.Find("#__VIEWSTATEGENERATOR").Attr("value")
+// 2. POST with form data
+data := make(url.Values)
+data.Set("__VIEWSTATE", viewState)
+data.Set("__VIEWSTATEGENERATOR", viewGen)
+data.Set("txtPrefix", prefix)
+data.Set("TextBoxAWBno", awbno)
+data.Set("ButtonGO", "Track")
+data.Set("ToolkitScriptManager1_HiddenField", "")
+postReq, _ := http.NewRequest("POST", "https://airasia.smartkargo.com/FrmAWBTracking.aspx", strings.NewReader(data.Encode()))
+postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+postReq.Header.Set("Referer", "https://airasia.smartkargo.com/FrmAWBTracking.aspx")
+postResp, err := cl.Do(postReq)
+if err != nil {
+return TrackResult{}, err
+}
+defer postResp.Body.Close()
+return parseTrackingHTML(postResp.Body)
+}
+
+func parseTrackingHTML(r io.Reader) (TrackResult, error) {
+doc, err := goquery.NewDocumentFromReader(r)
+if err != nil {
+return TrackResult{}, err
+}
+var res TrackResult
+res.Status = doc.Find("#lblLatestActivity").Text()
+res.Origin = doc.Find("#lblOrigin").Text()
+res.Dest = doc.Find("#lblDestination").Text()
+res.Pcs = doc.Find("#lblPcs").Text()
+res.GrossWt = doc.Find("#lblGrossWt").Text()
+res.LastAct = doc.Find("#lblLastActivityDescription").Text()
+// Find Delivery Order PDF link
+doc.Find("#gvDeliveryOrders a").Each(func(i int, s *goquery.Selection) {
+href, ok := s.Attr("href")
+if ok && strings.HasSuffix(href, ".pdf") {
+res.DOUrl = href
+}
+})
+return res, nil
+}
+
+func writeResultsToExcel(results []TrackResult, path string) error {
+xl := excelize.NewFile()
+sheet := "Sheet1"
+headers := []string{"MAWB", "Prefix", "AWBNo", "Status", "Origin", "Dest", "Pcs", "GrossWt", "LastAct", "DOUrl"}
+for i, h := range headers {
+cell, _ := excelize.CoordinatesToCellName(i+1, 1)
+xl.SetCellValue(sheet, cell, h)
+}
+for row, r := range results {
+vals := []string{r.MAWB, r.Prefix, r.AWBNo, r.Status, r.Origin, r.Dest, r.Pcs, r.GrossWt, r.LastAct, r.DOUrl}
+for col, v := range vals {
+cell, _ := excelize.CoordinatesToCellName(col+1, row+2)
+xl.SetCellValue(sheet, cell, v)
+}
+}
+return xl.SaveAs(path)
+}
+here is the json for google sheets
+{
+"type": "service_account",
+"project_id": "myproject-23c78",
+"private_key_id": "40861029cd7b1079453d2f42dcf8ef017a802c3e",
+"private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDQ2ry0gqZ/SaCv\nta92IM8BLPFU7yHjNk5jovWvJnsuy71M/Jippjwdch/4gH4w5cX06M3TuT7Ydj4W\nMW4rpKCYdHovKJ5E9T1iFX67C38sPpnkN2UNTIuj3Ez9THIfsTJXGH0cBo7vdq+a\n3oyIRcABADPkqsHmFfD4RVzm4v492Yt3cT5o+gJi3yOqApXsQf7afOyAaocD5Ec4\nUn6aW0PDihr1c0BoxgT+NPMFxxwIXlV0iITtNP4kmzNhaew1k4UKGLFIapBxgUCs\nvo0aEog0Q90UPT88d9s06wSt95RIqsSmdmeIaIqKutSQefD30ekyYe3B57UU1QrF\n1JWD4xhvAgMBAAECggEARMcjyZYU2moWvoZoZ9BaGxr/xmaRlE939RvfKHTVsA1s\nI4QzifqyZUgF+0HlTJj+Xa6kyYqBhas6uvhAPaMTN+Fzsz//DtpsAnbtqw8YLCvZ\nZexQHNcOTUHpIKkiFAm4eDIaUTZfr8A4CBot0VqW5j142V7aR7kGB9xfwbES5K68\nsXo3lN6rnE3BuDjGPwupAfdqOlWuxfkTEmLravqNRUVeW8E8W7Czewy+Bhx9RGOD\nQvAwJgwz5PcCzXwnQJ7Uqd6eabL6vxwQIcHIG3wcWRj3CV37KTbsee0MKR1aLNCj\nuc84dzm/2qiZ4YDu8ocTtLQQTr6TiBMdSBk2oR+qYQKBgQD4DA238UADwPA5/jIl\n8W+flsXMLzDnyFJRmzffojUpeRqufZLseM3ajPizqo2rGh772mhRHlPyhdUJs74V\nFmzWH9SqMGO7LkCqpBzHO+bq8vyPFOahQqkcYCuGenJdd8sq7bPzHfwqBJp47asX\nrJrfKaRQv8VrzhAi6JXHG1DDZwKBgQDXjP5/hwyF3lc5gDpzuu+BAPPVEcQPHd7D\nfgzQ9LWUTXztP+rcGWDFvTgPNhdPeFs0nJ+PkVYS79mkfStMPDwvaraPsJl8fQh3\nH8l81PyevDjCtoTZDop5Eu7R/ZpJ+4TBwvkiU8PPGB2BNnQHrfm8Jw/f0+j9o2bT\neKz4LngluQKBgDG4sNNLb8qQ1Va6prDGadqyrWmVmBcOJ7omBBg2+rMajIensljm\nilUh5wSUzpsavFU93aVNEATQYPj158dwXFa7wLRwyL0Ps3TBOueREWPNW2UPCoAO\nzblbab4mM2CbD8XGKkk0nISLsa9F7QLs3YqYXVC2cEuA3ekxeDyWNCVHAoGBAIxU\n29/U4X9KGMlzxRpRato274gZT+ZzkPL/XoKvvoO1yw5+3X27+/fgz91/Xr+7YM2o\n5mzGtx4PD0f6wbSZRqmsNPzpgZO9p0Q+6qOd2nXRnraNs4HI6LgYbmlCTS+7U1v+\nfsotdL6gOZ1FAVd6mas4VypmwTpYJnqpBxtwzYHpAoGAY4qUOKNYpq9ve2hoFdxa\nEffCwLTZGiJCl9sjv4RluapqM4iYTksIvptEQu7hdnB9Cunn3U0yyPuOP8FnSufS\nAivdjLq4ugMfilIoKjwYFLyGYr/7tlSUvZRPt5ym3vJ2eRfvh7kKrzLvgQL2rvH+\n6+oq0MVzTck6PFEZ6Q133Ok=\n-----END PRIVATE KEY-----\n",
+"client_email": "myproject-23c78@appspot.gserviceaccount.com",
+"client_id": "110108320854120047930",
+"auth_uri": "https://accounts.google.com/o/oauth2/auth",
+"token_uri": "https://oauth2.googleapis.com/token",
+"auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+"client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/myproject-23c78%40appspot.gserviceaccount.com",
+"universe_domain": "googleapis.com"
+}
