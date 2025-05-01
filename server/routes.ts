@@ -5,7 +5,7 @@ import multer from "multer";
 import { WebSocketServer } from "ws";
 import { z } from "zod";
 import path from "path";
-import { processCSVFile, processExcelFile, trackAWB, splitMAWB, generateExcelFile, updateGoogleSheet } from "./tracking";
+import { processCSVFile, processExcelFile, trackAWB, splitMAWB, generateExcelFile, updateGoogleSheet, cancelTrackingJob } from "./tracking";
 import { InsertTrackJob } from "@shared/schema";
 
 export async function registerRoutes(app: Express): Promise<Server> {
